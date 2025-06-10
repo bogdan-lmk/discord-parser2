@@ -4,12 +4,12 @@ import asyncio
 import threading
 import time
 from loguru import logger
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .services.telegram_bot import TelegramBotService
-from .services.discord_websocket import DiscordWebSocketService
-from .config.settings import config
-from .main import DiscordParser
+from discord_telegram_parser.services.telegram_bot import TelegramBotService
+from discord_telegram_parser.services.discord_websocket import DiscordWebSocketService
+from discord_telegram_parser.config.settings import config
+from discord_telegram_parser.main import DiscordParser
 
 class DiscordTelegramParser:
     def __init__(self):
@@ -28,24 +28,36 @@ class DiscordTelegramParser:
         self.running = False
         self.websocket_task = None
         
+        # Новые атрибуты для управления новыми серверами
+        self.new_server_handler = NewServerHandler(self.telegram_bot, self.discord_parser)
+        
     def discover_channels(self):
         """Discover announcement channels using channel_id_parser"""
         from discord_telegram_parser.utils.channel_id_parser import parse_discord_servers
         
         mappings = parse_discord_servers()
         if mappings:
+            # Проверяем на новые серверы
+            old_servers = set(config.SERVER_CHANNEL_MAPPINGS.keys()) if hasattr(config, 'SERVER_CHANNEL_MAPPINGS') else set()
+            new_servers = set(mappings.keys()) - old_servers
+            
+            if new_servers:
+                logger.info(f"🆕 Discovered {len(new_servers)} new servers:")
+                for server in new_servers:
+                    logger.info(f"   • {server}")
+                    
+                    # Планируем отложенную обработку для новых серверов
+                    if self.new_server_handler:
+                        self.new_server_handler.schedule_new_server_processing(server, mappings[server])
+            
             config.SERVER_CHANNEL_MAPPINGS = mappings
             
             # Add discovered channels to WebSocket subscriptions
             for server, channels in mappings.items():
                 for channel_id in channels.keys():
                     self.websocket_service.add_channel_subscription(channel_id)
-            
-            # Save discovered channels to config file
-            with open('discord_telegram_parser/config/settings.py', 'a') as f:
-                f.write(f"\n# Auto-discovered channels\nconfig.SERVER_CHANNEL_MAPPINGS = {json.dumps(mappings, indent=2)}\n")
         else:
-            print("Failed to discover channels")
+            logger.warning("Failed to discover channels")
     
     async def websocket_main_loop(self):
         """Main async loop for WebSocket service"""
@@ -80,11 +92,8 @@ class DiscordTelegramParser:
         if not text:
             return ""
         try:
-            # Handle surrogates and problematic characters
             if isinstance(text, str):
-                # Remove surrogates and invalid characters
                 text = text.encode('utf-8', 'surrogatepass').decode('utf-8', 'replace')
-                # Filter out characters that might cause issues
                 text = ''.join(char for char in text if ord(char) < 0x110000)
             return text
         except (UnicodeEncodeError, UnicodeDecodeError):
@@ -93,7 +102,7 @@ class DiscordTelegramParser:
     def test_channel_http_access(self, channel_id):
         """Quick test if channel is accessible via HTTP"""
         try:
-            session = self.discord_parser.sessions[0]  # Use first session
+            session = self.discord_parser.sessions[0]
             r = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1')
             return r.status_code == 200
         except:
@@ -112,18 +121,23 @@ class DiscordTelegramParser:
             logger.info(f"   Discord servers: {len(current_servers)}")
             logger.info(f"   Telegram topics: {len(telegram_topics)}")
             
-            # Clean up invalid topics first
+            # Выполняем проверку топиков при запуске для предотвращения дублей
+            if not self.telegram_bot.startup_verification_done:
+                logger.info("🔍 Performing startup verification to prevent topic duplicates...")
+                self.telegram_bot.startup_topic_verification()
+            
+            # Clean up invalid topics
             cleaned_topics = self.telegram_bot.cleanup_invalid_topics()
             if cleaned_topics > 0:
-                logger.info(f"   🧹 Cleaned {cleaned_topics} invalid topics")
-                telegram_topics = set(self.telegram_bot.server_topics.keys())  # Refresh after cleanup
+                logger.info(f"   🧹 Cleaned {cleaned_topics} invalid/duplicate topics")
+                telegram_topics = set(self.telegram_bot.server_topics.keys())
             
-            # Find new servers (don't create topics yet - wait for actual messages)
+            # Find new servers (don't create topics yet - wait for verification)
             new_servers = current_servers - telegram_topics
             if new_servers:
                 logger.info(f"   🆕 New servers found: {len(new_servers)}")
                 for server in new_servers:
-                    logger.info(f"      • {server} (topic will be created when needed)")
+                    logger.info(f"      • {server} (topic will be created after verification)")
             
             # Find removed servers to delete topics
             removed_servers = telegram_topics - current_servers
@@ -133,25 +147,27 @@ class DiscordTelegramParser:
                     if server in self.telegram_bot.server_topics:
                         old_topic_id = self.telegram_bot.server_topics[server]
                         del self.telegram_bot.server_topics[server]
+                        if old_topic_id in self.telegram_bot.topic_name_cache:
+                            del self.telegram_bot.topic_name_cache[old_topic_id]
                         logger.info(f"      • Removed {server} (topic {old_topic_id})")
                 
                 if removed_servers:
                     self.telegram_bot._save_data()
             
-            logger.success(f"✅ Server sync completed")
+            logger.success(f"✅ Server sync completed with anti-duplicate protection")
             
         except Exception as e:
             error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
             logger.error(f"❌ Error in server sync: {error_msg}")
 
     def initial_sync(self):
-        """Perform initial sync with improved topic management"""
+        """Perform initial sync with improved topic management and verification delay"""
         try:
             # Discover channels if not already configured
             if not config.SERVER_CHANNEL_MAPPINGS:
                 self.discover_channels()
             
-            # Sync servers between Discord and Telegram (cleanup invalid topics)
+            # Sync servers between Discord and Telegram with duplicate prevention
             self.sync_servers()
             
             # Get recent messages from HTTP-accessible channels only
@@ -165,6 +181,14 @@ class DiscordTelegramParser:
                     continue
                 
                 safe_server = self.safe_encode_string(server)
+                
+                # Проверяем, новый ли это сервер (может требовать верификации)
+                is_new_server = server not in self.telegram_bot.server_topics
+                if is_new_server:
+                    logger.info(f"🆕 New server detected: {safe_server} - will process after verification")
+                    # Планируем отложенную обработку
+                    self.new_server_handler.schedule_new_server_processing(server, channels)
+                    continue
                     
                 for channel_id, channel_name in channels.items():
                     safe_channel = self.safe_encode_string(channel_name)
@@ -205,6 +229,7 @@ class DiscordTelegramParser:
             logger.info(f"   ✅ HTTP synced: {len(http_channels)} channels")
             logger.info(f"   🔌 WebSocket only: {len(websocket_only_channels)} channels")
             logger.info(f"   📨 Total messages: {len(messages)}")
+            logger.info(f"   🆕 New servers: {len(self.new_server_handler.pending_servers)} (processing after verification)")
             
             if websocket_only_channels:
                 logger.info(f"🔌 These channels will be monitored via WebSocket only:")
@@ -223,12 +248,12 @@ class DiscordTelegramParser:
                         server_messages[server] = []
                     server_messages[server].append(msg)
                 
-                logger.info(f"📤 Sending messages for {len(server_messages)} servers with improved topic logic")
+                logger.info(f"📤 Sending messages for {len(server_messages)} servers with anti-duplicate topic logic")
                 
-                # Send messages with proper topic management
+                # Send messages with proper topic management (no duplicates!)
                 for server, msgs in server_messages.items():
                     logger.info(f"   📍 {server}: {len(msgs)} messages")
-                    # This will use the improved topic logic (one server = one topic)
+                    # This will use the improved topic logic (one server = one topic, no duplicates)
                     self.telegram_bot.send_messages(msgs)
                 
                 logger.success(f"✅ Initial HTTP sync completed: {len(messages)} messages sent")
@@ -255,16 +280,20 @@ class DiscordTelegramParser:
                 
                 logger.debug("🔄 Fallback polling check (HTTP channels only)...")
                 
-                server_messages = {}  # Group by server
+                server_messages = {}
                 recent_threshold = datetime.now().timestamp() - 120  # 2 minutes ago
                 
                 for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
+                    # Пропускаем новые серверы, которые еще не прошли верификацию
+                    if server in self.new_server_handler.pending_servers:
+                        continue
+                        
                     safe_server = self.safe_encode_string(server)
                     
                     for channel_id, channel_name in channels.items():
                         # Only poll HTTP-accessible channels
                         if not self.test_channel_http_access(channel_id):
-                            continue  # Skip WebSocket-only channels
+                            continue
                             
                         try:
                             safe_channel = self.safe_encode_string(channel_name)
@@ -299,15 +328,15 @@ class DiscordTelegramParser:
                             logger.debug(f"Fallback polling error for {safe_server}#{safe_channel}: {e}")
                             continue
                 
-                # Send messages grouped by server (proper topic management)
+                # Send messages grouped by server (proper topic management with no duplicates)
                 if server_messages:
                     total_messages = sum(len(msgs) for msgs in server_messages.values())
                     logger.info(f"🔄 Fallback polling found {total_messages} new messages in {len(server_messages)} servers")
                     
                     for server, msgs in server_messages.items():
-                        msgs.sort(key=lambda x: x.timestamp)  # Chronological order
+                        msgs.sort(key=lambda x: x.timestamp)
                         logger.info(f"   📍 {server}: {len(msgs)} messages")
-                        self.telegram_bot.send_messages(msgs)  # Uses improved topic logic
+                        self.telegram_bot.send_messages(msgs)  # Uses improved topic logic with duplicate prevention
                 
             except Exception as e:
                 error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
@@ -315,12 +344,12 @@ class DiscordTelegramParser:
                 time.sleep(60)
     
     def run(self):
-        """Run all components with improved topic management"""
+        """Run all components with improved topic management and verification handling"""
         self.running = True
         
         try:
-            # Perform smart initial sync with improved topic logic
-            logger.info("🚀 Starting smart initial sync with improved topic management...")
+            # Perform smart initial sync with improved topic logic and verification handling
+            logger.info("🚀 Starting smart initial sync with enhanced anti-duplicate topic management...")
             self.initial_sync()
             
             # Start Telegram bot in separate thread
@@ -329,11 +358,11 @@ class DiscordTelegramParser:
                 daemon=True
             )
             bot_thread.start()
-            logger.success("✅ Telegram bot started with improved topic logic")
+            logger.success("✅ Telegram bot started with enhanced anti-duplicate topic logic")
             
             # Start WebSocket service in separate thread
             websocket_thread = self.run_websocket_in_thread()
-            logger.success("✅ WebSocket service started")
+            logger.success("✅ WebSocket service started with new server detection")
             
             # Start fallback polling in separate thread (HTTP channels only)
             fallback_thread = threading.Thread(
@@ -343,15 +372,25 @@ class DiscordTelegramParser:
             fallback_thread.start()
             logger.success("✅ Fallback polling started (HTTP channels only)")
             
+            # Start new server handler
+            new_server_thread = threading.Thread(
+                target=self.new_server_handler.run,
+                daemon=True
+            )
+            new_server_thread.start()
+            logger.success("✅ New server handler started with verification delay")
+            
             # Keep main thread alive
-            logger.success("🎉 Discord Telegram Parser running with improved topic management!")
-            logger.info("📊 Features:")
-            logger.info("   ✅ One server = One topic (no duplicates)")
-            logger.info("   ✅ Thread-safe topic creation")
-            logger.info("   ✅ Auto-cleanup of invalid topics")
-            logger.info("   ✅ HTTP channels: Initial sync + fallback polling")
-            logger.info("   ✅ WebSocket channels: Real-time monitoring")
-            logger.info("   ✅ Messages grouped by server")
+            logger.success("🎉 Discord Telegram Parser running with ENHANCED features!")
+            logger.info("📊 Enhanced Features:")
+            logger.info("   🛡️ ANTI-DUPLICATE topic protection (startup verification)")
+            logger.info("   ⏰ New server verification delay (3 minutes)")
+            logger.info("   🔒 Thread-safe topic creation")
+            logger.info("   🧹 Auto-cleanup of invalid/duplicate topics")
+            logger.info("   📡 HTTP channels: Initial sync + fallback polling")
+            logger.info("   🔌 WebSocket channels: Real-time monitoring")
+            logger.info("   🆕 Automatic new server detection and setup")
+            logger.info("   📋 Messages grouped by server (one topic per server)")
             logger.info("Press Ctrl+C to stop")
             
             while self.running:
@@ -365,14 +404,259 @@ class DiscordTelegramParser:
             if self.websocket_service:
                 asyncio.run(self.websocket_service.stop())
                 
+            # Stop new server handler
+            if self.new_server_handler:
+                self.new_server_handler.stop()
+                
         except Exception as e:
             error_msg = str(e).encode('utf-8', 'replace').decode('utf-8')
             logger.error(f"Error in main run loop: {error_msg}")
             self.running = False
 
+
+class NewServerHandler:
+    """Обработчик новых серверов с задержкой для верификации"""
+    
+    def __init__(self, telegram_bot, discord_parser):
+        self.telegram_bot = telegram_bot
+        self.discord_parser = discord_parser
+        self.pending_servers = {}  # server_name -> {'channels': {}, 'join_time': datetime}
+        self.verification_delay = 180  # 3 минуты
+        self.running = False
+        
+    def schedule_new_server_processing(self, server_name, channels):
+        """Планирует обработку нового сервера с задержкой"""
+        logger.info(f"📅 Scheduling new server processing: {server_name}")
+        logger.info(f"⏰ Will process after {self.verification_delay} seconds for verification")
+        
+        self.pending_servers[server_name] = {
+            'channels': channels,
+            'join_time': datetime.now(),
+            'processed': False
+        }
+        
+        logger.info(f"📋 Pending servers: {len(self.pending_servers)}")
+    
+    def check_server_verification(self, server_name, channels):
+        """Проверяет, прошел ли сервер верификацию досрочно"""
+        try:
+            # Пытаемся получить доступ к одному из каналов
+            for channel_id in list(channels.keys())[:1]:  # Проверяем только первый канал
+                try:
+                    session = self.discord_parser.sessions[0]
+                    r = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1')
+                    if r.status_code == 200:
+                        logger.info(f"✅ Early verification passed for {server_name}")
+                        return True
+                    elif r.status_code == 403:
+                        # Все еще нет доступа
+                        return False
+                except Exception as e:
+                    logger.debug(f"Verification check error for {server_name}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.debug(f"Server verification check failed for {server_name}: {e}")
+            
+        return False
+    
+    def process_new_server(self, server_name, channels):
+        """Обрабатывает новый сервер: создает топик и отправляет сообщения"""
+        try:
+            logger.info(f"🚀 Processing new server: {server_name}")
+            
+            # Добавляем сервер в конфигурацию, если его еще нет
+            if server_name not in config.SERVER_CHANNEL_MAPPINGS:
+                config.SERVER_CHANNEL_MAPPINGS[server_name] = channels
+                logger.info(f"📝 Added {server_name} to configuration with {len(channels)} channels")
+            
+            # Создаем топик для нового сервера (с защитой от дублей)
+            topic_id = self.telegram_bot._get_or_create_topic_safe(server_name)
+            
+            if not topic_id:
+                logger.error(f"❌ Failed to create topic for {server_name}")
+                return False
+            
+            logger.success(f"✅ Created topic {topic_id} for new server: {server_name}")
+            
+            # Собираем последние сообщения из всех каналов нового сервера
+            all_messages = []
+            accessible_channels = 0
+            
+            for channel_id, channel_name in channels.items():
+                try:
+                    # Проверяем доступ к каналу
+                    session = self.discord_parser.sessions[0]
+                    test_response = session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1')
+                    
+                    if test_response.status_code == 200:
+                        accessible_channels += 1
+                        
+                        # Получаем последние сообщения
+                        messages = self.discord_parser.parse_announcement_channel(
+                            channel_id,
+                            server_name,
+                            channel_name,
+                            limit=5  # По 5 сообщений с каждого канала
+                        )
+                        
+                        if messages:
+                            all_messages.extend(messages)
+                            logger.info(f"📥 Collected {len(messages)} messages from #{channel_name}")
+                        
+                    elif test_response.status_code == 403:
+                        logger.warning(f"⚠️ Still no access to {server_name}#{channel_name} - may need more time")
+                    else:
+                        logger.warning(f"⚠️ Unexpected response {test_response.status_code} for {server_name}#{channel_name}")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Error accessing {server_name}#{channel_name}: {e}")
+                    continue
+            
+            logger.info(f"📊 Server {server_name} access summary:")
+            logger.info(f"   📡 Total channels: {len(channels)}")
+            logger.info(f"   ✅ Accessible channels: {accessible_channels}")
+            logger.info(f"   📨 Total messages collected: {len(all_messages)}")
+            
+            # Отправляем приветственное сообщение
+            welcome_msg = (
+                f"🎉 **Welcome to {server_name}!**\n\n"
+                f"🆕 This server was just added to monitoring.\n"
+                f"📡 Monitoring {accessible_channels}/{len(channels)} channels.\n"
+                f"📨 Found {len(all_messages)} recent announcements.\n\n"
+            )
+            
+            if accessible_channels == 0:
+                welcome_msg += (
+                    "⚠️ **No channels accessible yet** - this is normal for new servers.\n"
+                    "🔒 Please complete server verification/rules acceptance.\n"
+                    "📡 Will start monitoring once access is granted.\n\n"
+                    "🔄 You can manually check later using /servers command."
+                )
+            elif accessible_channels < len(channels):
+                welcome_msg += (
+                    f"📋 **Latest announcements** (from accessible channels):"
+                )
+            else:
+                welcome_msg += (
+                    f"📋 **Latest announcements** from this server:"
+                )
+            
+            # Отправляем приветственное сообщение
+            sent_welcome = self.telegram_bot._send_message(
+                welcome_msg,
+                message_thread_id=topic_id,
+                server_name=server_name
+            )
+            
+            if sent_welcome:
+                logger.success(f"✅ Sent welcome message to {server_name}")
+            
+            # Отправляем собранные сообщения, если есть
+            if all_messages:
+                # Сортируем по времени и берем последние 10
+                all_messages.sort(key=lambda x: x.timestamp)
+                recent_messages = all_messages[-10:]
+                
+                logger.info(f"📤 Sending {len(recent_messages)} recent messages to {server_name}")
+                self.telegram_bot.send_messages(recent_messages)
+                
+            else:
+                # Отправляем информационное сообщение
+                info_msg = (
+                    "ℹ️ No recent messages found - this is normal for new servers.\n"
+                    "📡 Real-time monitoring is now active!\n"
+                    "🔔 You'll receive new announcements as they're posted."
+                )
+                
+                self.telegram_bot._send_message(
+                    info_msg,
+                    message_thread_id=topic_id,
+                    server_name=server_name
+                )
+            
+            logger.success(f"🎉 Successfully set up new server: {server_name}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing new server {server_name}: {e}")
+            return False
+    
+    def run(self):
+        """Основной цикл обработки новых серверов"""
+        self.running = True
+        logger.info("🚀 New Server Handler started")
+        
+        while self.running:
+            try:
+                time.sleep(30)  # Проверяем каждые 30 секунд
+                
+                current_time = datetime.now()
+                servers_to_process = []
+                
+                # Проверяем pending серверы
+                for server_name, server_data in list(self.pending_servers.items()):
+                    if server_data['processed']:
+                        continue
+                        
+                    join_time = server_data['join_time']
+                    channels = server_data['channels']
+                    
+                    # Проверяем, прошло ли достаточно времени или получили ли мы доступ досрочно
+                    time_elapsed = (current_time - join_time).total_seconds()
+                    
+                    if time_elapsed >= self.verification_delay:
+                        # Время вышло, обрабатываем в любом случае
+                        logger.info(f"⏰ Verification time elapsed for {server_name}, processing now")
+                        servers_to_process.append(server_name)
+                        
+                    elif time_elapsed >= 60:  # Проверяем досрочную верификацию только после 1 минуты
+                        # Проверяем досрочную верификацию
+                        if self.check_server_verification(server_name, channels):
+                            logger.info(f"✅ Early verification detected for {server_name}")
+                            servers_to_process.append(server_name)
+                
+                # Обрабатываем серверы
+                for server_name in servers_to_process:
+                    if server_name in self.pending_servers:
+                        server_data = self.pending_servers[server_name]
+                        
+                        if self.process_new_server(server_name, server_data['channels']):
+                            # Помечаем как обработанный
+                            self.pending_servers[server_name]['processed'] = True
+                            logger.success(f"✅ Successfully processed new server: {server_name}")
+                        else:
+                            logger.error(f"❌ Failed to process new server: {server_name}")
+                
+                # Удаляем обработанные серверы старше 1 часа
+                cutoff_time = current_time - timedelta(hours=1)
+                for server_name in list(self.pending_servers.keys()):
+                    server_data = self.pending_servers[server_name]
+                    if (server_data['processed'] and 
+                        server_data['join_time'] < cutoff_time):
+                        del self.pending_servers[server_name]
+                        logger.debug(f"🧹 Cleaned up processed server: {server_name}")
+                
+            except Exception as e:
+                logger.error(f"❌ Error in new server handler: {e}")
+                time.sleep(60)  # Ждем дольше при ошибке
+    
+    def stop(self):
+        """Остановка обработчика новых серверов"""
+        self.running = False
+        logger.info("🛑 New Server Handler stopped")
+
+
 def main():
     """Main entry point for the application"""
-    logger.info("Starting Discord Telegram Parser with WebSocket support...")
+    logger.info("🚀 Starting Discord Telegram Parser with ENHANCED features...")
+    logger.info("✨ Features enabled:")
+    logger.info("   🛡️ Anti-duplicate topic protection")
+    logger.info("   ⏰ New server verification delay")
+    logger.info("   🔍 Startup topic verification")
+    logger.info("   🆕 Automatic new server setup")
+    logger.info("   📡 Real-time WebSocket monitoring")
+    
     app = DiscordTelegramParser()
     app.run()
 

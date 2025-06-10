@@ -2,7 +2,7 @@ import asyncio
 import json
 import aiohttp
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from loguru import logger
 from discord_telegram_parser.models.message import Message
 from discord_telegram_parser.config.settings import config
@@ -15,9 +15,14 @@ class DiscordWebSocketService:
         self.session_id = None
         self.last_sequence = None
         self.subscribed_channels = set()
-        self.http_accessible_channels = set()  # Каналы доступные через HTTP
-        self.websocket_accessible_channels = set()  # Каналы доступные через WebSocket
+        self.http_accessible_channels = set()
+        self.websocket_accessible_channels = set()
         self.running = False
+        
+        # Новые атрибуты для управления верификацией
+        self.pending_servers = {}  # server_id -> {'join_time': datetime, 'verified': bool}
+        self.verification_delay = 180  # 3 минуты задержки
+        self.server_verification_cache = {}  # Кэш верифицированных серверов
         
         # Initialize WebSocket sessions for each token
         for token in config.DISCORD_TOKENS:
@@ -30,6 +35,406 @@ class DiscordWebSocketService:
             }
             self.websockets.append(ws_session)
     
+    async def handle_gateway_message(self, data, ws_session):
+        """Handle incoming WebSocket messages from Discord Gateway"""
+        try:
+            if data['op'] == 10:  # HELLO
+                self.heartbeat_interval = data['d']['heartbeat_interval']
+                logger.info(f"👋 Received HELLO, heartbeat interval: {self.heartbeat_interval}ms")
+                
+                # Start heartbeat
+                ws_session['heartbeat_task'] = asyncio.create_task(
+                    self.send_heartbeat(ws_session['websocket'], self.heartbeat_interval)
+                )
+                
+                # Send IDENTIFY
+                await self.identify(ws_session['websocket'], ws_session['token'])
+                
+            elif data['op'] == 11:  # HEARTBEAT_ACK
+                logger.debug("💚 Received heartbeat ACK")
+                
+            elif data['op'] == 0:  # DISPATCH
+                self.last_sequence = data['s']
+                event_type = data['t']
+                
+                if event_type == 'READY':
+                    self.session_id = data['d']['session_id']
+                    ws_session['user_id'] = data['d']['user']['id']
+                    user = data['d']['user']
+                    guilds = data['d']['guilds']
+                    
+                    logger.success(f"🚀 WebSocket ready for user: {user['username']}")
+                    logger.info(f"🏰 Connected to {len(guilds)} guilds")
+                    
+                    # Проверяем существующие топики при запуске
+                    await self.verify_existing_topics()
+                    
+                    # Используем гибридный подход для верификации каналов
+                    await self.hybrid_channel_verification(ws_session, guilds)
+                    
+                elif event_type == 'GUILD_CREATE':
+                    # Новый сервер добавлен или стал доступен
+                    guild = data['d']
+                    await self.handle_new_guild(guild, ws_session)
+                    
+                elif event_type == 'MESSAGE_CREATE':
+                    await self.handle_new_message(data['d'])
+                    
+        except Exception as e:
+            logger.error(f"Error handling gateway message: {e}")
+    
+    async def verify_existing_topics(self):
+        """Проверяем существующие топики при запуске и удаляем дубли"""
+        if not self.telegram_bot:
+            return
+            
+        logger.info("🔍 Verifying existing topics to prevent duplicates...")
+        
+        # Получаем список всех топиков в чате
+        try:
+            existing_topics = await self.get_all_forum_topics()
+            topic_names = {}  # name -> topic_id
+            
+            # Группируем топики по именам для поиска дублей
+            for topic_id, topic_name in existing_topics.items():
+                clean_name = topic_name.replace("🏰 ", "").strip()
+                if clean_name in topic_names:
+                    # Найден дубль! Удаляем старый топик
+                    old_topic_id = topic_names[clean_name]
+                    logger.warning(f"🗑️ Found duplicate topic for '{clean_name}': keeping {topic_id}, removing {old_topic_id}")
+                    await self.close_forum_topic(old_topic_id)
+                    
+                    # Обновляем mapping на новый топик
+                    if clean_name in self.telegram_bot.server_topics:
+                        if self.telegram_bot.server_topics[clean_name] == old_topic_id:
+                            self.telegram_bot.server_topics[clean_name] = topic_id
+                            logger.info(f"🔄 Updated topic mapping for '{clean_name}': {old_topic_id} -> {topic_id}")
+                
+                topic_names[clean_name] = topic_id
+            
+            # Синхронизируем с нашим кэшем
+            for server_name, cached_topic_id in list(self.telegram_bot.server_topics.items()):
+                if server_name in topic_names:
+                    actual_topic_id = topic_names[server_name]
+                    if cached_topic_id != actual_topic_id:
+                        logger.info(f"🔄 Syncing topic for '{server_name}': {cached_topic_id} -> {actual_topic_id}")
+                        self.telegram_bot.server_topics[server_name] = actual_topic_id
+                else:
+                    # Топик не существует в Telegram, удаляем из кэша
+                    logger.warning(f"🗑️ Removing non-existent topic from cache: '{server_name}' -> {cached_topic_id}")
+                    del self.telegram_bot.server_topics[server_name]
+            
+            self.telegram_bot._save_data()
+            logger.success(f"✅ Topic verification complete. Active topics: {len(self.telegram_bot.server_topics)}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error verifying existing topics: {e}")
+    
+    async def get_all_forum_topics(self):
+        """Получить все форум-топики в чате"""
+        topics = {}
+        try:
+            # Используем Telegram Bot API для получения топиков
+            loop = asyncio.get_event_loop()
+            chat_id = config.TELEGRAM_CHAT_ID
+            
+            # Проверяем, поддерживает ли чат топики
+            def check_chat():
+                try:
+                    chat = self.telegram_bot.bot.get_chat(chat_id)
+                    return getattr(chat, 'is_forum', False)
+                except:
+                    return False
+            
+            is_forum = await loop.run_in_executor(None, check_chat)
+            if not is_forum:
+                return topics
+            
+            # К сожалению, Telegram Bot API не предоставляет метод для получения всех топиков
+            # Поэтому мы проверяем только те, что у нас в кэше
+            for server_name, topic_id in list(self.telegram_bot.server_topics.items()):
+                def check_topic():
+                    return self.telegram_bot._topic_exists(chat_id, topic_id)
+                
+                exists = await loop.run_in_executor(None, check_topic)
+                if exists:
+                    topics[topic_id] = server_name
+                    
+        except Exception as e:
+            logger.error(f"Error getting forum topics: {e}")
+            
+        return topics
+    
+    async def close_forum_topic(self, topic_id):
+        """Закрыть форум-топик"""
+        try:
+            loop = asyncio.get_event_loop()
+            chat_id = config.TELEGRAM_CHAT_ID
+            
+            def close_topic():
+                try:
+                    self.telegram_bot.bot.close_forum_topic(
+                        chat_id=chat_id,
+                        message_thread_id=topic_id
+                    )
+                    return True
+                except Exception as e:
+                    logger.error(f"Error closing topic {topic_id}: {e}")
+                    return False
+            
+            result = await loop.run_in_executor(None, close_topic)
+            if result:
+                logger.info(f"🔒 Closed duplicate topic {topic_id}")
+            
+        except Exception as e:
+            logger.error(f"Error closing forum topic {topic_id}: {e}")
+    
+    async def handle_new_guild(self, guild_data, ws_session):
+        """Обработка нового сервера с учетом верификации"""
+        guild_id = guild_data['id']
+        guild_name = guild_data['name']
+        
+        logger.info(f"🆕 New guild detected: {guild_name} (ID: {guild_id})")
+        
+        # Проверяем, известен ли нам этот сервер
+        is_new_server = guild_name not in config.SERVER_CHANNEL_MAPPINGS
+        
+        if is_new_server:
+            logger.info(f"🔍 Completely new server: {guild_name}")
+            
+            # Добавляем в pending с временной меткой
+            self.pending_servers[guild_id] = {
+                'name': guild_name,
+                'join_time': datetime.now(),
+                'verified': False,
+                'channels_discovered': False
+            }
+            
+            # Планируем отложенную обработку
+            asyncio.create_task(self.delayed_server_processing(guild_id, guild_data, ws_session))
+            
+        else:
+            # Известный сервер, обрабатываем сразу
+            logger.info(f"♻️ Known server reconnected: {guild_name}")
+            await self.process_guild_channels(guild_data, ws_session)
+    
+    async def delayed_server_processing(self, guild_id, guild_data, ws_session):
+        """Отложенная обработка нового сервера после верификации"""
+        guild_name = guild_data['name']
+        
+        logger.info(f"⏰ Scheduling delayed processing for {guild_name} (waiting {self.verification_delay}s for verification)")
+        
+        # Ждем указанное время или пока не пройдем верификацию
+        start_time = datetime.now()
+        while (datetime.now() - start_time).seconds < self.verification_delay:
+            # Проверяем, прошли ли мы верификацию досрочно
+            if await self.check_server_verification(guild_id, ws_session):
+                logger.success(f"✅ Early verification passed for {guild_name}")
+                break
+                
+            await asyncio.sleep(10)  # Проверяем каждые 10 секунд
+        
+        # Обновляем статус верификации
+        if guild_id in self.pending_servers:
+            self.pending_servers[guild_id]['verified'] = True
+        
+        logger.info(f"🚀 Starting delayed processing for {guild_name}")
+        
+        # Обрабатываем каналы сервера
+        await self.process_guild_channels(guild_data, ws_session)
+        
+        # Создаем топик и отправляем последние сообщения
+        await self.setup_new_server_topic(guild_data, ws_session)
+        
+        # Удаляем из pending
+        if guild_id in self.pending_servers:
+            del self.pending_servers[guild_id]
+    
+    async def check_server_verification(self, guild_id, ws_session):
+        """Проверка прохождения верификации на сервере"""
+        try:
+            # Пытаемся получить доступ к каналам сервера
+            async with aiohttp.ClientSession() as session:
+                headers = {'Authorization': ws_session['token']}
+                
+                async with session.get(
+                    f'https://discord.com/api/v9/guilds/{guild_id}/channels',
+                    headers=headers
+                ) as resp:
+                    if resp.status == 200:
+                        channels = await resp.json()
+                        # Проверяем, есть ли доступные каналы
+                        accessible_channels = [ch for ch in channels if ch.get('type') in [0, 5]]
+                        return len(accessible_channels) > 0
+                    
+        except Exception as e:
+            logger.debug(f"Verification check failed for guild {guild_id}: {e}")
+            
+        return False
+    
+    async def setup_new_server_topic(self, guild_data, ws_session):
+        """Создание топика и отправка последних сообщений для нового сервера"""
+        guild_name = guild_data['name']
+        
+        if not self.telegram_bot:
+            logger.warning("❌ Telegram bot not available for topic creation")
+            return
+        
+        logger.info(f"🏗️ Setting up topic for new server: {guild_name}")
+        
+        # Создаем топик (используя безопасный метод без дублей)
+        loop = asyncio.get_event_loop()
+        topic_id = await loop.run_in_executor(
+            None,
+            self.telegram_bot._get_or_create_topic_safe,
+            guild_name
+        )
+        
+        if not topic_id:
+            logger.error(f"❌ Failed to create topic for {guild_name}")
+            return
+        
+        logger.success(f"✅ Created topic {topic_id} for {guild_name}")
+        
+        # Получаем последние сообщения из announcement каналов
+        announcement_channels = []
+        if guild_name in config.SERVER_CHANNEL_MAPPINGS:
+            for channel_id, channel_name in config.SERVER_CHANNEL_MAPPINGS[guild_name].items():
+                announcement_channels.append((channel_id, channel_name))
+        
+        # Собираем сообщения из всех announcement каналов
+        all_messages = []
+        for channel_id, channel_name in announcement_channels[:3]:  # Максимум 3 канала
+            try:
+                # Пытаемся получить последние сообщения
+                if self.telegram_bot.discord_parser:
+                    messages = self.telegram_bot.discord_parser.parse_announcement_channel(
+                        channel_id,
+                        guild_name,
+                        channel_name,
+                        limit=5  # По 5 сообщений с каждого канала
+                    )
+                    all_messages.extend(messages)
+                    logger.info(f"📥 Collected {len(messages)} messages from #{channel_name}")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️ Could not collect messages from {guild_name}#{channel_name}: {e}")
+        
+        # Отправляем сообщения в хронологическом порядке
+        if all_messages:
+            all_messages.sort(key=lambda x: x.timestamp)
+            all_messages = all_messages[-10:]  # Последние 10 сообщений
+            
+            logger.info(f"📤 Sending {len(all_messages)} welcome messages to {guild_name}")
+            
+            # Отправляем приветственное сообщение
+            welcome_msg = f"🎉 Welcome to {guild_name}!\n\n📋 Latest announcements from this server:"
+            await loop.run_in_executor(
+                None,
+                self.telegram_bot._send_message,
+                welcome_msg,
+                None,  # chat_id
+                topic_id,  # message_thread_id
+                guild_name  # server_name
+            )
+            
+            # Отправляем сообщения
+            self.telegram_bot.send_messages(all_messages)
+            
+        else:
+            # Отправляем просто приветственное сообщение
+            welcome_msg = f"🎉 Welcome to {guild_name}!\n\n📡 Now monitoring announcements from this server."
+            await loop.run_in_executor(
+                None,
+                self.telegram_bot._send_message,
+                welcome_msg,
+                None,  # chat_id
+                topic_id,  # message_thread_id
+                guild_name  # server_name
+            )
+    
+    async def process_guild_channels(self, guild_data, ws_session):
+        """Process channels from guild data and auto-discover new ones"""
+        try:
+            guild_name = guild_data['name']
+            guild_id = guild_data['id']
+            channels_in_guild = guild_data.get('channels', [])
+            
+            logger.info(f"🔍 Processing channels for guild: {guild_name}")
+            
+            # Ищем announcement каналы в порядке приоритета
+            announcement_channels = []
+            for channel in channels_in_guild:
+                # 1. Точное совпадение с "announcements"
+                if channel['type'] == 0 and channel['name'].lower() == 'announcements':
+                    announcement_channels.append(channel)
+                    continue
+                
+                # 2. Официальный тип announcement
+                if channel.get('type') == 5:
+                    announcement_channels.append(channel)
+                    continue
+                
+                # 3. Другие варианты
+                if (channel['type'] == 0 and 
+                    any(keyword in channel['name'].lower() 
+                        for keyword in ['announce', 'news', 'объявлен', 'анонс'])):
+                    announcement_channels.append(channel)
+            
+            if not announcement_channels:
+                logger.info(f"ℹ️ No announcement channels found in {guild_name}")
+                return
+            
+            logger.info(f"🔍 Found {len(announcement_channels)} announcement channels in {guild_name}")
+            
+            new_channels_added = 0
+            
+            # Проверяем, есть ли уже конфигурация для этого сервера
+            if guild_name not in config.SERVER_CHANNEL_MAPPINGS:
+                config.SERVER_CHANNEL_MAPPINGS[guild_name] = {}
+            
+            for channel in announcement_channels:
+                channel_id = channel['id']
+                channel_name = channel['name']
+                
+                # Проверяем, есть ли уже в конфиге
+                if channel_id not in config.SERVER_CHANNEL_MAPPINGS[guild_name]:
+                    # Тестируем доступ
+                    http_works = await self.test_http_access(
+                        channel_id, guild_name, channel_name, ws_session['token']
+                    )
+                    
+                    # WebSocket доступ уже подтвержден (канал в guild data)
+                    websocket_works = True
+                    
+                    if http_works or websocket_works:
+                        # Добавляем новый канал
+                        config.SERVER_CHANNEL_MAPPINGS[guild_name][channel_id] = channel_name
+                        
+                        # Добавляем в подписки
+                        self.subscribed_channels.add(channel_id)
+                        if http_works:
+                            self.http_accessible_channels.add(channel_id)
+                        if websocket_works:
+                            self.websocket_accessible_channels.add(channel_id)
+                        
+                        access_type = "HTTP+WS" if http_works else "WS only"
+                        logger.success(f"   ✅ Auto-added: {guild_name}#{channel_name} ({access_type})")
+                        new_channels_added += 1
+            
+            if new_channels_added > 0:
+                logger.info(f"🎉 Auto-discovered {new_channels_added} new channels in {guild_name}")
+                
+                # Обновляем кэш верификации
+                self.server_verification_cache[guild_id] = {
+                    'verified': True,
+                    'timestamp': datetime.now()
+                }
+            
+        except Exception as e:
+            logger.error(f"Error processing guild channels: {e}")
+    
+    # Остальные методы остаются без изменений...
     async def identify(self, websocket, token):
         """Send IDENTIFY payload with comprehensive intents"""
         identify_payload = {
@@ -75,79 +480,17 @@ class DiscordWebSocketService:
                     f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1',
                     headers=headers
                 ) as resp:
-                    if resp.status == 200:
-                        return True
-                    else:
-                        return False
+                    return resp.status == 200
                         
         except Exception as e:
             return False
     
-    def check_websocket_channel_access(self, channel_id, guilds_data):
-        """Check if channel is accessible via WebSocket guild data"""
-        for guild in guilds_data:
-            channels = guild.get('channels', [])
-            for channel in channels:
-                if channel['id'] == channel_id:
-                    # Проверяем в порядке приоритета:
-                    # 1. Точное название "announcements"
-                    if channel['type'] == 0 and channel['name'].lower() == 'announcements':
-                        return True
-                    # 2. Официальный тип announcement
-                    if channel.get('type') == 5:
-                        return True
-                    # 3. Другие варианты названий
-                    if (channel['type'] == 0 and 
-                        any(keyword in channel['name'].lower() 
-                            for keyword in ['announcements'])):
-                        return True
-        return False
+    def add_channel_subscription(self, channel_id):
+        """Add a channel to subscription list"""
+        self.subscribed_channels.add(channel_id)
+        logger.info(f"Added channel {channel_id} to subscriptions")
     
-    async def handle_gateway_message(self, data, ws_session):
-        """Handle incoming WebSocket messages from Discord Gateway"""
-        try:
-            if data['op'] == 10:  # HELLO
-                self.heartbeat_interval = data['d']['heartbeat_interval']
-                logger.info(f"👋 Received HELLO, heartbeat interval: {self.heartbeat_interval}ms")
-                
-                # Start heartbeat
-                ws_session['heartbeat_task'] = asyncio.create_task(
-                    self.send_heartbeat(ws_session['websocket'], self.heartbeat_interval)
-                )
-                
-                # Send IDENTIFY
-                await self.identify(ws_session['websocket'], ws_session['token'])
-                
-            elif data['op'] == 11:  # HEARTBEAT_ACK
-                logger.debug("💚 Received heartbeat ACK")
-                
-            elif data['op'] == 0:  # DISPATCH
-                self.last_sequence = data['s']
-                event_type = data['t']
-                
-                if event_type == 'READY':
-                    self.session_id = data['d']['session_id']
-                    ws_session['user_id'] = data['d']['user']['id']
-                    user = data['d']['user']
-                    guilds = data['d']['guilds']
-                    
-                    logger.success(f"🚀 WebSocket ready for user: {user['username']}")
-                    logger.info(f"🏰 Connected to {len(guilds)} guilds")
-                    
-                    # Используем гибридный подход для верификации каналов
-                    await self.hybrid_channel_verification(ws_session, guilds)
-                    
-                elif event_type == 'MESSAGE_CREATE':
-                    await self.handle_new_message(data['d'])
-                    
-                elif event_type == 'GUILD_CREATE':
-                    guild = data['d']
-                    logger.info(f"🏰 Guild loaded: {guild['name']} ({guild['id']})")
-                    await self.process_guild_channels(guild, ws_session)
-                    
-        except Exception as e:
-            logger.error(f"Error handling gateway message: {e}")
-    
+    # Остальные методы класса остаются без изменений...
     async def hybrid_channel_verification(self, ws_session, guilds_data):
         """Hybrid verification: HTTP + WebSocket channel discovery"""
         logger.info("🔍 Starting hybrid channel verification...")
@@ -221,98 +564,25 @@ class DiscordWebSocketService:
         
         return len(total_monitoring)
     
-    async def process_guild_channels(self, guild_data, ws_session):
-        """Process channels from guild data and auto-discover new ones"""
-        try:
-            guild_name = guild_data['name']
-            channels_in_guild = guild_data.get('channels', [])
-            
-            # Ищем announcement каналы в порядке приоритета:
-            # 1. Точное название "announcements"
-            # 2. Официальный тип 5
-            # 3. Другие варианты названий
-            announcement_channels = []
-            for channel in channels_in_guild:
-                # 1. Точное совпадение с "announcements"
-                if channel['type'] == 0 and channel['name'].lower() == 'announcements':
-                    announcement_channels.append(channel)
-                    continue
-                
-                # 2. Официальный тип announcement
-                if channel.get('type') == 5:
-                    announcement_channels.append(channel)
-                    continue
-                
-                # 3. Другие варианты (только если еще не добавлен)
-                if (channel['type'] == 0 and 
-                    any(keyword in channel['name'].lower() 
-                        for keyword in ['announce', 'news', 'объявлен', 'анонс'])):
-                    announcement_channels.append(channel)
-            
-            if announcement_channels:
-                logger.info(f"🔍 Found {len(announcement_channels)} announcement channels in {guild_name}")
-                
-                new_channels_added = 0
-                for channel in announcement_channels:
-                    channel_id = channel['id']
-                    channel_name = channel['name']
-                    
-                    # Проверяем, есть ли уже в конфиге
-                    already_configured = False
-                    for server, channels in config.SERVER_CHANNEL_MAPPINGS.items():
-                        if channel_id in channels:
-                            already_configured = True
-                            break
-                    
-                    if not already_configured:
-                        # Тестируем доступ
-                        http_works = await self.test_http_access(
-                            channel_id, guild_name, channel_name, ws_session['token']
-                        )
-                        
-                        # WebSocket доступ уже подтвержден (канал в guild data)
-                        websocket_works = True
-                        
-                        if http_works or websocket_works:
-                            # Добавляем новый канал
-                            if guild_name not in config.SERVER_CHANNEL_MAPPINGS:
-                                config.SERVER_CHANNEL_MAPPINGS[guild_name] = {}
-                            config.SERVER_CHANNEL_MAPPINGS[guild_name][channel_id] = channel_name
-                            
-                            # Добавляем в подписки
-                            self.subscribed_channels.add(channel_id)
-                            if http_works:
-                                self.http_accessible_channels.add(channel_id)
-                            if websocket_works:
-                                self.websocket_accessible_channels.add(channel_id)
-                            
-                            access_type = "HTTP+WS" if http_works else "WS only"
-                            logger.success(f"   ✅ Auto-added: {guild_name}#{channel_name} ({access_type})")
-                            
-                            # Add channel to subscriptions
-                            self.subscribed_channels.add(channel_id)
-                            if http_works:
-                                self.http_accessible_channels.add(channel_id)
-                            if websocket_works:
-                                self.websocket_accessible_channels.add(channel_id)
-                            
-                            # Only create topic once per server
-                            if guild_name not in [s for s in config.SERVER_CHANNEL_MAPPINGS.keys()]:
-                                if self.telegram_bot:
-                                    loop = asyncio.get_event_loop()
-                                    loop.run_in_executor(
-                                        None,
-                                        self.telegram_bot._get_or_create_topic_safe,
-                                        guild_name
-                                    )
-                            
-                            new_channels_added += 1
-                
-                if new_channels_added > 0:
-                    logger.info(f"🎉 Auto-discovered {new_channels_added} new channels in {guild_name}")
-                        
-        except Exception as e:
-            logger.error(f"Error processing guild channels: {e}")
+    def check_websocket_channel_access(self, channel_id, guilds_data):
+        """Check if channel is accessible via WebSocket guild data"""
+        for guild in guilds_data:
+            channels = guild.get('channels', [])
+            for channel in channels:
+                if channel['id'] == channel_id:
+                    # Проверяем в порядке приоритета:
+                    # 1. Точное название "announcements"
+                    if channel['type'] == 0 and channel['name'].lower() == 'announcements':
+                        return True
+                    # 2. Официальный тип announcement
+                    if channel.get('type') == 5:
+                        return True
+                    # 3. Другие варианты названий
+                    if (channel['type'] == 0 and 
+                        any(keyword in channel['name'].lower() 
+                            for keyword in ['announcements'])):
+                        return True
+        return False
     
     async def handle_new_message(self, message_data):
         """Process new message from WebSocket with improved topic management"""
@@ -530,11 +800,6 @@ class DiscordWebSocketService:
         
         for ws_session in self.websockets:
             await self.cleanup_websocket(ws_session)
-    
-    def add_channel_subscription(self, channel_id):
-        """Add a channel to subscription list"""
-        self.subscribed_channels.add(channel_id)
-        logger.info(f"Added channel {channel_id} to subscriptions")
     
     def remove_channel_subscription(self, channel_id):
         """Remove a channel from subscription list"""

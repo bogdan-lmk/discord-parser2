@@ -49,16 +49,4 @@ config.TELEGRAM_CHAT_ID = -1002890737800
 
 
 
-# Auto-discovered channels
-config.SERVER_CHANNEL_MAPPINGS = {
-  "EnsoFi": {
-    "1230813806981021740": "\ud83d\udea8\ufe31announcement",
-    "1230815022293450776": "\ud83d\udd08\ufe31defi-announcement",
-    "1350428355211690005": "\ud83d\udce3\ufe31event-announcement",
-    "1372897682544132218": "\ud83d\udd08\ufe31defai-announcement",
-    "1372899741180104785": "\ud83d\udd08\ufe31elander-announcement"
-  },
-  "\u0421\u0435\u0440\u0432\u0435\u0440 vikaets": {
-    "1381919567638433853": "announcements"
-  }
-}
+
