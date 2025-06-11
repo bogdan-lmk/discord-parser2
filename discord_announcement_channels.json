@@ -25,6 +25,24 @@
       }
     }
   },
+  "Helios Blockchain": {
+    "guild_id": "1346632185901355009",
+    "guild_name": "Helios Blockchain",
+    "announcement_channels": {
+      "📢︱general-announcements": {
+        "channel_id": "1353904692194705490",
+        "category": "1353903952214757507"
+      },
+      "💻︱dev-announcements": {
+        "channel_id": "1354131346221563915",
+        "category": "1353903952214757507"
+      },
+      "🎮︱event-announcements": {
+        "channel_id": "1370606844896346214",
+        "category": "1353903952214757507"
+      }
+    }
+  },
   "Сервер vikaets": {
     "guild_id": "1381917743439417497",
     "guild_name": "Сервер vikaets",
