@@ -362,24 +362,14 @@ class DiscordWebSocketService:
             
             logger.info(f"🔍 Processing channels for guild: {guild_name}")
             
-            # Ищем announcement каналы в порядке приоритета
+            # Find first channel with name ending in "announcement" or "announcements"
             announcement_channels = []
             for channel in channels_in_guild:
-                # 1. Точное совпадение с "announcements"
-                if channel['type'] == 0 and channel['name'].lower() == 'announcements':
+                lower_name = channel['name'].lower()
+                if (lower_name.endswith('announcement') or 
+                    lower_name.endswith('announcements')):
                     announcement_channels.append(channel)
-                    continue
-                
-                # 2. Официальный тип announcement
-                if channel.get('type') == 5:
-                    announcement_channels.append(channel)
-                    continue
-                
-                # 3. Другие варианты
-                if (channel['type'] == 0 and 
-                    any(keyword in channel['name'].lower() 
-                        for keyword in ['announce', 'news', 'объявлен', 'анонс'])):
-                    announcement_channels.append(channel)
+                    break  # Only keep first match
             
             if not announcement_channels:
                 logger.info(f"ℹ️ No announcement channels found in {guild_name}")
@@ -570,17 +560,9 @@ class DiscordWebSocketService:
             channels = guild.get('channels', [])
             for channel in channels:
                 if channel['id'] == channel_id:
-                    # Проверяем в порядке приоритета:
-                    # 1. Точное название "announcements"
-                    if channel['type'] == 0 and channel['name'].lower() == 'announcements':
-                        return True
-                    # 2. Официальный тип announcement
-                    if channel.get('type') == 5:
-                        return True
-                    # 3. Другие варианты названий
-                    if (channel['type'] == 0 and 
-                        any(keyword in channel['name'].lower() 
-                            for keyword in ['announcements'])):
+                    lower_name = channel['name'].lower()
+                    if (lower_name.endswith('announcement') or 
+                        lower_name.endswith('announcements')):
                         return True
         return False
     

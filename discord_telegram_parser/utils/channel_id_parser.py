@@ -10,6 +10,7 @@ class DiscordIDCollector:
         self.session = requests.Session()
         self.session.headers = {'Authorization': self.token}
         self.servers_data = {}
+        
 
     def get_guilds(self):
         """Get list of guilds/servers the user is in with pagination"""
@@ -99,27 +100,14 @@ class DiscordIDCollector:
                 }
 
                 channels = self.get_guild_channels(guild['id'])
-                # Ищем announcement каналы в порядке приоритета:
-                # 1. Точное название "announcements"
-                # 2. Официальный тип 5
-                # 3. Другие варианты названий
+                # Find first channel with name ending in "announcement" or "announcements"
                 announcement_channels = []
                 for ch in channels:
-                    # 1. Точное совпадение с "announcements"
-                    if ch['type'] == 0 and ch['name'].lower() == 'announcements':
+                    lower_name = ch['name'].lower()
+                    if (lower_name.endswith('announcement') or 
+                        lower_name.endswith('announcements')):
                         announcement_channels.append(ch)
-                        continue
-                    
-                    # 2. Официальный тип announcement
-                    if ch.get('type') == 5:
-                        announcement_channels.append(ch)
-                        continue
-                    
-                    # 3. Другие варианты (только если еще не добавлен)
-                    if (ch['type'] == 0 and 
-                        any(keyword in ch['name'].lower() 
-                            for keyword in ['announce'])):
-                        announcement_channels.append(ch)
+                        break  # Only keep first match
                 
                 for channel in announcement_channels:
                     guild_data['announcement_channels'][channel['name']] = {

@@ -6,22 +6,6 @@
       "🚨︱announcement": {
         "channel_id": "1230813806981021740",
         "category": "1230815094246740009"
-      },
-      "🔈︱defi-announcement": {
-        "channel_id": "1230815022293450776",
-        "category": "1372805317959749642"
-      },
-      "📣︱event-announcement": {
-        "channel_id": "1350428355211690005",
-        "category": "1230815512599072789"
-      },
-      "🔈︱defai-announcement": {
-        "channel_id": "1372897682544132218",
-        "category": "1372802885531865088"
-      },
-      "🔈︱elander-announcement": {
-        "channel_id": "1372899741180104785",
-        "category": "1372796780118544445"
       }
     }
   },
@@ -31,14 +15,6 @@
     "announcement_channels": {
       "📢︱general-announcements": {
         "channel_id": "1353904692194705490",
-        "category": "1353903952214757507"
-      },
-      "💻︱dev-announcements": {
-        "channel_id": "1354131346221563915",
-        "category": "1353903952214757507"
-      },
-      "🎮︱event-announcements": {
-        "channel_id": "1370606844896346214",
         "category": "1353903952214757507"
       }
     }
