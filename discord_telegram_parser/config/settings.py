@@ -39,7 +39,7 @@ config = Config()
 
 
 
-config.TELEGRAM_CHAT_ID = -1002890737800
+config.TELEGRAM_CHAT_ID = -1002881735463
 
 
 
