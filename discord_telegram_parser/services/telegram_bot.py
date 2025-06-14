@@ -91,7 +91,7 @@ class TelegramBotService:
                 for server_name, topic_id in list(self.server_topics.items()):
                     if self._topic_exists(chat_id, topic_id):
                         # Проверяем на дубли по названию
-                        topic_name = f"🏰 {server_name}"
+                        topic_name = f"{server_name}"
                         
                         if topic_name in existing_valid_topics:
                             # Найден дубль! Закрываем старый топик
@@ -228,7 +228,7 @@ class TelegramBotService:
                 return None
             
             # Проверяем, нет ли уже топика с таким именем (дополнительная защита)
-            topic_name = f"🏰 {server_name}"
+            topic_name = f"{server_name}"
             for existing_server, existing_topic_id in self.server_topics.items():
                 if existing_server != server_name and self._topic_exists(chat_id, existing_topic_id):
                     try:
@@ -431,7 +431,7 @@ class TelegramBotService:
                     invalid_topics.append(server_name)
                 else:
                     # Проверяем на дубли
-                    topic_name = f"🏰 {server_name}"
+                    topic_name = f"{server_name}"
                     if topic_name in valid_topics:
                         # Найден дубль, закрываем старый
                         old_topic_id = valid_topics[topic_name]
@@ -588,7 +588,7 @@ class TelegramBotService:
                     topic_indicator = " 🆕"  # New server, no topic yet
                 
                 markup.add(InlineKeyboardButton(
-                    f"🏰 {server}{topic_indicator}",
+                    f"{server}{topic_indicator}",
                     callback_data=f"server_{server}"
                 ))
             markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
@@ -797,7 +797,7 @@ class TelegramBotService:
                 topic_info = "📋 Topic: Not created yet"
             
             text = (
-                f"🏰 **{server_name}**\n\n"
+                f"**{server_name}**\n\n"
                 f"📊 Channels: {channel_count}\n"
                 f"{topic_info}\n\n"
                 f"📋 **Configured Channels:**\n"
@@ -1037,7 +1037,7 @@ class TelegramBotService:
                     topic_indicator = " 🆕"  # New server, no topic yet
                 
                 markup.add(InlineKeyboardButton(
-                    f"🏰 {server}{topic_indicator}",
+                    f"{server}{topic_indicator}",
                     callback_data=f"server_{server}"
                 ))
             markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
@@ -1246,7 +1246,7 @@ class TelegramBotService:
                 topic_info = "📋 Topic: Not created yet"
             
             text = (
-                f"🏰 **{server_name}**\n\n"
+                f"**{server_name}**\n\n"
                 f"📊 Channels: {channel_count}\n"
                 f"{topic_info}\n\n"
                 f"📋 **Configured Channels:**\n"
